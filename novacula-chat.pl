@@ -38,7 +38,7 @@ my $PING_INTERVAL_S    = 30;
 my $PONG_TIMEOUT_S     = 90;
 
 # ALWAYS use Mac mini M1 UA (as requested)
-my $IG_USER_AGENT      = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15';
+my $IG_USER_AGENT      = 'Mozilla/5.0 (Macintosh; Apple M1 Mac OS X 14_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15';
 
 # Tiny IG cache (10 minutes)
 my $IG_CACHE_TTL_S      = 600;
@@ -49,6 +49,9 @@ my $IG_CACHE_LAST_SWEEP = time();
 # CORS (default: allow all)
 my $CORS_ALL = 1;
 my %CORS_ALLOW;                # exact origin => 1 (when restricting)
+
+# NEW: if set via CLI, bypass Instagram curl validation completely
+my $DO_NOT_CHECK_IG = 0;
 
 my %ERC = (
   MALFORMED          => 1,
@@ -97,6 +100,10 @@ sub dbg {
   return unless $ENV{NOVACULA_DEBUG_WS};
   log_err("DEBUG: " . join("", @_));
 }
+sub dbg_ig {
+  return unless $ENV{NOVACULA_DEBUG_IG};
+  log_err("IG: " . join("", @_));
+}
 
 sub parse_cli_args {
   my @a = @ARGV;
@@ -120,9 +127,10 @@ sub parse_cli_args {
           if (%h) { $CORS_ALL = 0; %CORS_ALLOW = %h; }
         }
       }
+    } elsif ($x eq '--do-not-check-ig') {
+      $DO_NOT_CHECK_IG = 1;
     } else {
       # ignore unknown flags (do not break existing deployments)
-      # (server-side only; never shown to clients)
       log_err("Ignoring unknown CLI arg: $x");
     }
   }
@@ -596,14 +604,17 @@ sub start_ig_worker {
     binmode($w, ":raw");
     my $url = "https://www.instagram.com/$userfb";
 
+    # No Range, force http1.1
     my @cmd = (
       'curl',
+      '--http1.1',
       '--connect-timeout', '2',
-      '--max-time', '5',
+      '--max-time', '6',
       '-L',
       '-sS',
-      '-r', '0-65535',
       '-A', $IG_USER_AGENT,
+      '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      '-H', 'Accept-Language: en-US,en;q=0.9',
       $url,
       '-w', "\nNC_HTTP_CODE:%{http_code}\n"
     );
@@ -613,7 +624,7 @@ sub start_ig_worker {
 
     {
       local $SIG{ALRM} = sub { die "timeout\n" };
-      alarm 7;
+      alarm 8;
       if (open(my $ch, "-|", @cmd)) {
         local $/;
         $out = <$ch> // '';
@@ -623,34 +634,32 @@ sub start_ig_worker {
       alarm 0;
     }
 
-    if (!$ok || $out eq '') { print $w "NO\n"; close($w); exit 0; }
+    if (!$ok || $out eq '') { dbg_ig("check userfb=$userfb result=NO reason=curl_empty"); print $w "NO\n"; close($w); exit 0; }
 
     my $code = '';
     if ($out =~ s/\nNC_HTTP_CODE:(\d{3})\n\z//) { $code = $1; }
-    else { print $w "NO\n"; close($w); exit 0; }
+    else { dbg_ig("check userfb=$userfb result=NO reason=no_http_code_marker"); print $w "NO\n"; close($w); exit 0; }
 
-    if ($code eq '404') { print $w "NO\n"; close($w); exit 0; }
-    if ($code !~ /\A(200|301|302)\z/) { print $w "NO\n"; close($w); exit 0; }
+    if ($code eq '404') { dbg_ig("check userfb=$userfb http=$code result=NO"); print $w "NO\n"; close($w); exit 0; }
+    if ($code eq '403' || $code eq '429') { dbg_ig("check userfb=$userfb http=$code result=NO (blocked/rate-limited)"); print $w "NO\n"; close($w); exit 0; }
 
-    my $body = $out;
-    my $lc = lc($body);
+    if ($code !~ /\A(200|206|301|302|303|307|308)\z/) { dbg_ig("check userfb=$userfb http=$code result=NO (unhandled_code)"); print $w "NO\n"; close($w); exit 0; }
+
+    my $lc = lc($out);
 
     if ($lc =~ /polarisrouteconfig"\s*:\s*\{\s*"pageid"\s*:\s*"httperrorpage"/) {
-      print $w "NO\n"; close($w); exit 0;
-    }
-    if ($lc =~ /sorry,\s*this page isn[’']t available/ ||
-        $lc =~ /this page isn[’']t available/ ||
-        $lc =~ /the link you followed may be broken/ ||
-        $lc =~ /page not found/ ) {
+      dbg_ig("check userfb=$userfb http=$code result=NO (httpErrorPage)");
       print $w "NO\n"; close($w); exit 0;
     }
 
     my $u = $userfb;
     $u =~ s/([\\"])/\\$1/g;
-    if ($lc =~ /"pageid"\s*:\s*"httperrorpage".{0,1200}"url"\s*:\s*"\\\/\Q$u\E"/s) {
+    if ($lc =~ /"pageid"\s*:\s*"httperrorpage".{0,2000}"url"\s*:\s*"\\\/\Q$u\E"/s) {
+      dbg_ig("check userfb=$userfb http=$code result=NO (httpErrorPage_url_match)");
       print $w "NO\n"; close($w); exit 0;
     }
 
+    dbg_ig("check userfb=$userfb http=$code result=OK");
     print $w "OK\n"; close($w); exit 0;
   }
 
@@ -880,8 +889,6 @@ sub handle_ws_upgrade {
   return (0, http_err("400 Bad Request", $ERC{MALFORMED}, $req)) if !defined($ver) || $ver ne '13';
 
   my $accept = ws_accept_value($sec_key);
-
-  # (Not required for WS by browsers, but provided as requested)
   my $cors = cors_headers_for_req($req);
 
   my $resp =
@@ -979,6 +986,13 @@ sub ws_handle_message_obj {
       my ($hx,$as) = _dump_bytes_preview($comment_utf8);
       log_err("COMMENT_INVALID: whitespace_only bytes=$comment_bytes hex=$hx asc=$as");
       conn_send_ws_err($c, $ERC{COMMENT_INVALID});
+      return;
+    }
+
+    # NEW: bypass IG curl validation when CLI flag is set
+    if ($DO_NOT_CHECK_IG) {
+      dbg("IG bypass enabled: accepting post without IG check userfb=$userfb bytes=$comment_bytes");
+      accept_post_after_validation($c, $userfb, $comment_utf8);
       return;
     }
 
@@ -1154,10 +1168,10 @@ $listen->blocking(0);
 my $sel = IO::Select->new($listen);
 
 if ($CORS_ALL) {
-  log_err("Novacula-Chat build=$BUILD_ID listening on $LISTEN_HOST:$LISTEN_PORT (CORS: allow-all)");
+  log_err("Novacula-Chat build=$BUILD_ID listening on $LISTEN_HOST:$LISTEN_PORT (CORS: allow-all" . ($DO_NOT_CHECK_IG ? ", IG: bypass" : ", IG: enabled") . ")");
 } else {
   my @o = sort keys %CORS_ALLOW;
-  log_err("Novacula-Chat build=$BUILD_ID listening on $LISTEN_HOST:$LISTEN_PORT (CORS: allowlist=" . join(",", @o) . ")");
+  log_err("Novacula-Chat build=$BUILD_ID listening on $LISTEN_HOST:$LISTEN_PORT (CORS: allowlist=" . join(",", @o) . ($DO_NOT_CHECK_IG ? ", IG: bypass" : ", IG: enabled") . ")");
 }
 
 my $last_periodic_purge_check = time();

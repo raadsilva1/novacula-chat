@@ -10,6 +10,7 @@ SERVER_ARGS=()
 # args:
 #   --production
 #   --cors [origins]
+#   --do-not-check-ig
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --production)
@@ -19,14 +20,17 @@ while [[ $# -gt 0 ]]; do
     --cors)
       SERVER_ARGS+=("--cors")
       shift
-      # optional value (origins or "*"); if next token is not another flag, use it
       if [[ $# -gt 0 && "$1" != --* ]]; then
         SERVER_ARGS+=("$1")
         shift
       fi
       ;;
+    --do-not-check-ig)
+      SERVER_ARGS+=("--do-not-check-ig")
+      shift
+      ;;
     *)
-      echo "Usage: $0 [--production] [--cors [ORIGINS]]" >&2
+      echo "Usage: $0 [--production] [--cors [ORIGINS]] [--do-not-check-ig]" >&2
       exit 1
       ;;
   esac
@@ -49,8 +53,6 @@ ctr tasks kill -s SIGKILL "${NAME}" >/dev/null 2>&1 || true
 ctr tasks rm "${NAME}" >/dev/null 2>&1 || true
 ctr containers rm "${NAME}" >/dev/null 2>&1 || true
 
-# Use a fast mirror WITHOUT writing /etc (works even if /etc is RO)
-# NOTE: -R applies for this invocation and avoids touching /etc/xbps.d
 XBPS_REPO_MAIN="https://repo-fastly.voidlinux.org/current"
 
 if [[ "${MODE}" != "production" ]]; then
@@ -58,6 +60,7 @@ if [[ "${MODE}" != "production" ]]; then
     --env "NOVACULA_AUTH_SECRET=${NOVACULA_AUTH_SECRET}" \
     --env "NOVACULA_CHAT_KEY=${NOVACULA_CHAT_KEY}" \
     --env "NOVACULA_DEBUG_WS=${NOVACULA_DEBUG_WS:-}" \
+    --env "NOVACULA_DEBUG_IG=${NOVACULA_DEBUG_IG:-}" \
     --mount "type=bind,src=$(pwd),dst=/src,options=rbind:ro" \
     --mount "type=bind,src=$(pwd)/data,dst=/var/lib/novacula-chat,options=rbind:rw" \
     "${IMAGE}" "${NAME}" \
@@ -77,13 +80,6 @@ if [[ "${MODE}" != "production" ]]; then
   exit 0
 fi
 
-# --production mode:
-# - detached via host nohup
-# - host FS exposure restricted: mount ONLY server file (RO) + data dir (RW)
-# - 400MB RAM MAX: use ctr --memory-limit if present (ctr expects BYTES)
-# IMPORTANT: do NOT use --readonly here because we install packages at runtime;
-#            a read-only rootfs would break xbps installs. Host FS is still restricted.
-
 LOGFILE="$(pwd)/data/novacula-chat.production.log"
 MEM_LIMIT_BYTES=$((400 * 1024 * 1024))
 
@@ -102,6 +98,7 @@ nohup ctr run --net-host \
   --env "NOVACULA_AUTH_SECRET=${NOVACULA_AUTH_SECRET}" \
   --env "NOVACULA_CHAT_KEY=${NOVACULA_CHAT_KEY}" \
   --env "NOVACULA_DEBUG_WS=${NOVACULA_DEBUG_WS:-}" \
+  --env "NOVACULA_DEBUG_IG=${NOVACULA_DEBUG_IG:-}" \
   --mount "type=bind,src=$(pwd)/novacula-chat.pl,dst=/novacula-chat.pl,options=rbind:ro" \
   --mount "type=bind,src=$(pwd)/data,dst=/var/lib/novacula-chat,options=rbind:rw" \
   --mount "type=tmpfs,dst=/tmp,options=nosuid:nodev:noexec" \
@@ -121,7 +118,6 @@ nohup ctr run --net-host \
 
 disown || true
 
-# Best-effort memory cap via cgroup (only used when --memory-limit flag isn't available)
 if [[ -n "${CGROUP_NAME}" ]]; then
   if [[ -f "/sys/fs/cgroup/${CGROUP_NAME}/memory.max" ]]; then
     echo "${MEM_LIMIT_BYTES}" > "/sys/fs/cgroup/${CGROUP_NAME}/memory.max" 2>/dev/null || true
