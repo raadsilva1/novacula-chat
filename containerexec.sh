@@ -7,7 +7,7 @@ NAME="novacula-chat"
 MODE="default"
 SERVER_ARGS=()
 
-# parse args:
+# args:
 #   --production
 #   --cors [origins]
 while [[ $# -gt 0 ]]; do
@@ -49,6 +49,10 @@ ctr tasks kill -s SIGKILL "${NAME}" >/dev/null 2>&1 || true
 ctr tasks rm "${NAME}" >/dev/null 2>&1 || true
 ctr containers rm "${NAME}" >/dev/null 2>&1 || true
 
+# Use a fast mirror WITHOUT writing /etc (works even if /etc is RO)
+# NOTE: -R applies for this invocation and avoids touching /etc/xbps.d
+XBPS_REPO_MAIN="https://repo-fastly.voidlinux.org/current"
+
 if [[ "${MODE}" != "production" ]]; then
   ctr run --rm --net-host \
     --env "NOVACULA_AUTH_SECRET=${NOVACULA_AUTH_SECRET}" \
@@ -62,39 +66,29 @@ if [[ "${MODE}" != "production" ]]; then
       export LC_ALL=C
       export LANG=C
 
-      mkdir -p /etc/xbps.d
-      cp -f /usr/share/xbps.d/*repository*.conf /etc/xbps.d/ 2>/dev/null || true
-      if ls /etc/xbps.d/*repository*.conf >/dev/null 2>&1; then
-        sed -i "s|https://repo-default.voidlinux.org|https://repo-fastly.voidlinux.org|g" /etc/xbps.d/*repository*.conf || true
-        sed -i "s|http://repo-default.voidlinux.org|https://repo-fastly.voidlinux.org|g" /etc/xbps.d/*repository*.conf || true
-      else
-        printf "repository=https://repo-fastly.voidlinux.org/current\n" > /etc/xbps.d/00-repository-main.conf
-      fi
-
-      xbps-install -Sy -y perl openssl curl ca-certificates tzdata
+      xbps-install -Sy -y -R "'"${XBPS_REPO_MAIN}"'" perl openssl curl ca-certificates tzdata
 
       mkdir -p /opt/novacula-chat
       cp -a /src/* /opt/novacula-chat/
       cd /opt/novacula-chat
 
-      exec perl /opt/novacula-chat/novacula-chat.pl '"${SERVER_ARGS[@]/#/}"'
-    '
+      exec perl /opt/novacula-chat/novacula-chat.pl "$@"
+    ' -- "${SERVER_ARGS[@]}"
   exit 0
 fi
 
-# production
+# --production mode:
+# - detached via host nohup
+# - host FS exposure restricted: mount ONLY server file (RO) + data dir (RW)
+# - 400MB RAM MAX: use ctr --memory-limit if present (ctr expects BYTES)
+# IMPORTANT: do NOT use --readonly here because we install packages at runtime;
+#            a read-only rootfs would break xbps installs. Host FS is still restricted.
+
 LOGFILE="$(pwd)/data/novacula-chat.production.log"
 MEM_LIMIT_BYTES=$((400 * 1024 * 1024))
 
 MEM_ARGS=()
 CGROUP_NAME=""
-RO_ARGS=()
-
-if ctr run --help 2>&1 | grep -q -- '--readonly'; then
-  RO_ARGS+=(--readonly)
-elif ctr run --help 2>&1 | grep -q -- '--read-only'; then
-  RO_ARGS+=(--read-only)
-fi
 
 if ctr run --help 2>&1 | grep -q -- '--memory-limit'; then
   MEM_ARGS+=(--memory-limit "${MEM_LIMIT_BYTES}")
@@ -104,7 +98,6 @@ elif ctr run --help 2>&1 | grep -q -- '--cgroup'; then
 fi
 
 nohup ctr run --net-host \
-  "${RO_ARGS[@]}" \
   "${MEM_ARGS[@]}" \
   --env "NOVACULA_AUTH_SECRET=${NOVACULA_AUTH_SECRET}" \
   --env "NOVACULA_CHAT_KEY=${NOVACULA_CHAT_KEY}" \
@@ -119,24 +112,16 @@ nohup ctr run --net-host \
     export LC_ALL=C
     export LANG=C
 
-    mkdir -p /etc/xbps.d
-    cp -f /usr/share/xbps.d/*repository*.conf /etc/xbps.d/ 2>/dev/null || true
-    if ls /etc/xbps.d/*repository*.conf >/dev/null 2>&1; then
-      sed -i "s|https://repo-default.voidlinux.org|https://repo-fastly.voidlinux.org|g" /etc/xbps.d/*repository*.conf || true
-      sed -i "s|http://repo-default.voidlinux.org|https://repo-fastly.voidlinux.org|g" /etc/xbps.d/*repository*.conf || true
-    else
-      printf "repository=https://repo-fastly.voidlinux.org/current\n" > /etc/xbps.d/00-repository-main.conf
-    fi
-
-    xbps-install -Sy -y perl openssl curl ca-certificates tzdata
+    xbps-install -Sy -y -R "'"${XBPS_REPO_MAIN}"'" perl openssl curl ca-certificates tzdata
 
     mkdir -p /var/lib/novacula-chat
-    exec perl /novacula-chat.pl '"${SERVER_ARGS[@]/#/}"'
-  ' \
+    exec perl /novacula-chat.pl "$@"
+  ' -- "${SERVER_ARGS[@]}" \
   >"${LOGFILE}" 2>&1 &
 
 disown || true
 
+# Best-effort memory cap via cgroup (only used when --memory-limit flag isn't available)
 if [[ -n "${CGROUP_NAME}" ]]; then
   if [[ -f "/sys/fs/cgroup/${CGROUP_NAME}/memory.max" ]]; then
     echo "${MEM_LIMIT_BYTES}" > "/sys/fs/cgroup/${CGROUP_NAME}/memory.max" 2>/dev/null || true
